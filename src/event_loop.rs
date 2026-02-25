@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::borrow_unchecked::borrow_unchecked;
-use ext_php_rs::{boxed::ZBox, call_user_func, prelude::*, types::ZendHashTable, zend::Function};
+use ext_php_rs::{call_user_func, prelude::*, zend::Function};
 use lazy_static::lazy_static;
 use std::{
     cell::RefCell,
@@ -23,6 +23,9 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, RawFd},
     sync::mpsc::{channel, Receiver, Sender},
 };
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::AcqRel;
 use ext_php_rs::types::Zval;
 use tokio::runtime::Runtime;
 
@@ -89,6 +92,7 @@ fn sys_pipe() -> io::Result<(RawFd, RawFd)> {
 }
 
 pub struct EventLoop {
+    pending_notify: Arc<AtomicBool>,
     sender: Sender<Suspension>,
     receiver: Receiver<Suspension>,
 
@@ -147,12 +151,15 @@ impl EventLoop {
 
             let sender = c.sender.clone();
             let mut notifier = c.notify_sender.try_clone().unwrap();
+            let pending_notify = c.pending_notify.clone();
 
             (
                 RUNTIME.spawn(async move {
                     let res = future.await;
                     sender.send(suspension).unwrap();
-                    notifier.write_all(&[0]).unwrap();
+                    if !pending_notify.swap(true, AcqRel) {
+                        notifier.write_all(&[0]).unwrap();
+                    }
                     res
                 }),
                 unsafe { borrow_unchecked(&c.get_current_suspension) },
@@ -174,14 +181,25 @@ impl EventLoop {
         EVENTLOOP.with_borrow_mut(|c| {
             let c = c.as_mut().unwrap();
 
-            while let Ok(1) = c.notify_receiver.read(&mut c.dummy) {}
+            c.notify_receiver.read_exact(&mut c.dummy).unwrap();
 
-            for mut suspesion in c.receiver.try_iter() {
-                suspesion.0
-                    .object_mut()
-                    .unwrap()
-                    .try_call_method("resume", vec![])?;
+            loop {
+                while let Ok(mut suspension) = c.receiver.try_recv() {
+                    suspension.0
+                        .object_mut()
+                        .unwrap()
+                        .try_call_method("resume", vec![])?;
+                }
+
+                let was_pending = c.pending_notify.swap(false, AcqRel);
+
+                if !was_pending {
+                    c.notify_receiver.read_exact(&mut c.dummy).unwrap();
+                } else {
+                    break;
+                }
             }
+
             Ok(())
         })
     }
@@ -215,6 +233,7 @@ impl EventLoop {
         }
 
         Ok(Self {
+            pending_notify: Arc::new(AtomicBool::new(false)),
             sender,
             receiver,
             notify_sender: unsafe { File::from_raw_fd(notify_sender) },
