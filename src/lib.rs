@@ -12,9 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod borrow_unchecked;
+mod async_scope;
+#[cfg(feature = "revolt")]
+mod channel;
+#[cfg(feature = "revolt")]
 mod event_loop;
+#[cfg(feature = "native")]
+mod native_event_loop;
+#[cfg(feature = "revolt")]
+mod suspension;
 
+#[cfg(feature = "revolt")]
 pub use event_loop::EventLoop;
+#[cfg(feature = "revolt")]
 pub use event_loop::RUNTIME;
-pub use php_tokio_derive::php_async_impl;
+#[cfg(feature = "native")]
+pub use native_event_loop::{create_fiber, setup_module, EventLoop};
+
+pub use php_tokio_derive::{php_async_function, php_async_impl};
+
+#[cfg(all(feature = "revolt", feature = "native"))]
+compile_error!("Features `revolt` and `native` cannot be enabled at the same time.");

@@ -12,190 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::borrow_unchecked::borrow_unchecked;
-use ext_php_rs::types::Zval;
+use crate::async_scope::Scope;
+use crate::channel::Channel;
+use crate::suspension::Suspension;
 use ext_php_rs::{call_user_func, prelude::*, zend::Function};
 use lazy_static::lazy_static;
-use std::{
-    cell::RefCell,
-    fs::File,
-    future::Future,
-    io::{self, Read, Write},
-    os::fd::{AsRawFd, FromRawFd, RawFd},
-    sync::mpsc::{channel, Receiver, Sender},
-};
-use tokio::runtime::Runtime;
+use std::cell::RefCell;
+use std::future::pending;
+use std::future::Future;
+use tokio::runtime::{Handle, Runtime};
 
 lazy_static! {
-    pub static ref RUNTIME: Runtime = Runtime::new().expect("Could not allocate runtime");
+    pub static ref RUNTIME: Handle = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = Runtime::new().expect("Failed to create runtime");
+            tx.send(rt.handle().clone()).expect("Failed to send handle");
+            rt.block_on(pending::<()>());
+        });
+        rx.recv().expect("Failed to receive handle")
+    };
 }
 
 thread_local! {
-    static EVENTLOOP: RefCell<Option<EventLoop>> = RefCell::new(None);
+    static CHANNEL: RefCell<Option<Channel>> = const { RefCell::new(None) };
 }
 
-#[cfg(any(target_os = "linux", target_os = "solaris"))]
-fn sys_pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut pipefd = [0; 2];
-    let ret = unsafe { libc::pipe2(pipefd.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((pipefd[0], pipefd[1]))
-}
-
-#[cfg(any(target_os = "macos"))]
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    use libc::fcntl;
-    use libc::{FD_CLOEXEC, F_GETFD, F_SETFD};
-
-    let flags = unsafe { fcntl(fd, F_GETFD, 0) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let ret = unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos"))]
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    use libc::{fcntl, F_SETFL, O_NONBLOCK};
-
-    let ret = unsafe { fcntl(fd, F_SETFL, O_NONBLOCK) };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos"))]
-fn sys_pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut pipefd = [0; 2];
-    let ret = unsafe { libc::pipe(pipefd.as_mut_ptr()) };
-
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    for fd in &pipefd {
-        set_cloexec(*fd)?;
-        set_nonblocking(*fd)?;
-    }
-    Ok((pipefd[0], pipefd[1]))
-}
-
-pub struct EventLoop {
-    sender: Sender<Suspension>,
-    receiver: Receiver<Suspension>,
-
-    notify_sender: File,
-    notify_receiver: File,
-
-    get_current_suspension: Function,
-
-    dummy: [u8; 1],
-}
-
-/// # Safety
-///
-/// `Suspension` contains a PHP `Zval`, but it is never accessed from Tokio threads.
-/// The value is only moved across threads and sent back through a channel.
-/// All interaction with the inner `Zval` (e.g. calling `resume()`) happens
-/// exclusively on the original PHP thread in `EventLoop::wakeup()`.
-///
-/// Therefore, no PHP memory is accessed off-thread, making `Send` and `Sync` sound
-/// under this invariant.
-struct Suspension(Zval);
-unsafe impl Send for Suspension {}
-unsafe impl Sync for Suspension {}
+pub struct EventLoop;
 
 impl EventLoop {
     pub fn init() -> PhpResult<u64> {
-        EVENTLOOP.with_borrow_mut(|e| {
-            Ok(match e {
-                None => e.insert(Self::new()?),
-                Some(ev) => ev,
-            }
-            .notify_receiver
-            .as_raw_fd() as u64)
-        })
-    }
-
-    pub fn suspend_on<T: Send + 'static, F: Future<Output = T> + Send + 'static>(future: F) -> T {
-        // What's going on here? Unsafe borrows???
-        // NO: this is actually 100% safe, and here's why.
-        //
-        // Rust thinks we're Sending the Future to another thread (tokio's event loop),
-        // where it may be used even after its lifetime expires in the main (PHP) thread.
-        //
-        // In reality, the Future is only used by Tokio until the result is ready.
-        //
-        // Rust does not understand that when we suspend the current fiber in suspend_on,
-        // we basically keep alive the the entire stack,
-        // including the Rust stack and the Future on it, until the result of the future is ready.
-        //
-        // Once the result of the Future is ready, tokio doesn't need it anymore,
-        // the suspend_on function is resumed, and we safely drop the Future upon exiting.
-        //
-        let (future, get_current_suspension) = EVENTLOOP.with_borrow_mut(move |c| {
-            let c = c.as_mut().unwrap();
-            let suspension = Suspension(call_user_func!(c.get_current_suspension).unwrap());
-
-            let sender = c.sender.clone();
-            let mut notifier = c.notify_sender.try_clone().unwrap();
-
-            (
-                RUNTIME.spawn(async move {
-                    let res = future.await;
-                    sender.send(suspension).unwrap();
-                    notifier.write_all(&[0]).unwrap();
-                    res
-                }),
-                unsafe { borrow_unchecked(&c.get_current_suspension) },
-            )
-        });
-
-        // We suspend the fiber here, the Rust stack is kept alive until the result is ready.
-        call_user_func!(get_current_suspension)
-            .unwrap()
-            .try_call_method("suspend", vec![])
-            .unwrap();
-
-        // We've resumed, the `future` is already resolved and is not used by the tokio thread, it's safe to drop it.
-
-        return RUNTIME.block_on(future).unwrap();
-    }
-
-    pub fn wakeup() -> PhpResult<()> {
-        EVENTLOOP.with_borrow_mut(|c| {
-            let c = c.as_mut().unwrap();
-
-            while let Ok(1) = c.notify_receiver.read(&mut c.dummy) {}
-
-            for mut suspesion in c.receiver.try_iter() {
-                suspesion
-                    .0
-                    .object_mut()
-                    .unwrap()
-                    .try_call_method("resume", vec![])?;
-            }
-            Ok(())
-        })
-    }
-
-    pub fn shutdown() {
-        EVENTLOOP.set(None)
-    }
-
-    pub fn new() -> PhpResult<Self> {
-        let (sender, receiver) = channel();
-        let (notify_receiver, notify_sender) =
-            sys_pipe().map_err(|err| format!("Could not create pipe: {}", err))?;
-
         if !call_user_func!(
             Function::try_from_function("class_exists").unwrap(),
             "\\Revolt\\EventLoop"
@@ -203,7 +49,7 @@ impl EventLoop {
         .bool()
         .unwrap_or(false)
         {
-            return Err(format!("\\Revolt\\EventLoop does not exist!").into());
+            return Err("\\Revolt\\EventLoop does not exist!".to_string().into());
         }
         if !call_user_func!(
             Function::try_from_function("interface_exists").unwrap(),
@@ -212,20 +58,47 @@ impl EventLoop {
         .bool()
         .unwrap_or(false)
         {
-            return Err(format!("\\Revolt\\EventLoop\\Suspension does not exist!").into());
+            return Err("\\Revolt\\EventLoop\\Suspension does not exist!"
+                .to_string()
+                .into());
         }
 
-        Ok(Self {
-            sender,
-            receiver,
-            notify_sender: unsafe { File::from_raw_fd(notify_sender) },
-            notify_receiver: unsafe { File::from_raw_fd(notify_receiver) },
-            dummy: [0; 1],
-            get_current_suspension: Function::try_from_method(
-                "\\Revolt\\EventLoop",
-                "getSuspension",
-            )
-            .ok_or("\\Revolt\\EventLoop::getSuspension does not exist")?,
+        CHANNEL.with_borrow_mut(|e| {
+            Ok(match e {
+                None => e.insert(Channel::new()),
+                Some(ev) => ev,
+            }
+            .raw_fd() as u64)
         })
+    }
+
+    pub fn suspend_on<F>(future: F) -> PhpResult<F::Output>
+    where
+        F: Future + Send,
+        F::Output: Send + 'static,
+    {
+        let waker = CHANNEL.with_borrow(|c| c.as_ref().unwrap().waker());
+        let suspension = Suspension::get_current()?;
+        let suspension_finished = suspension.clone();
+        let scope = Scope::spawn(RUNTIME.clone(), async {
+            let response = future.await;
+            waker.send(suspension_finished);
+            response
+        });
+
+        // We suspend the fiber here, the Rust stack is kept alive until the result is ready.
+        suspension.suspend()?;
+
+        // We've resumed, the `future` is already resolved and is not used by the tokio thread, it's safe to drop it.
+        Ok(scope.block_on().map_err(|e| e.to_string())?)
+    }
+
+    pub fn wakeup() -> PhpResult<()> {
+        CHANNEL.with_borrow_mut(|c| c.as_mut().unwrap().resume_all());
+        Ok(())
+    }
+
+    pub fn shutdown() {
+        CHANNEL.set(None)
     }
 }
