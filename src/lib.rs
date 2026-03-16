@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod async_scope;
 mod event_loop;
 
 pub use event_loop::setup_module;

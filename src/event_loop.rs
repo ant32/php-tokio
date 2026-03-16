@@ -1,3 +1,4 @@
+use crate::async_scope::Scope;
 use ext_php_rs::convert::IntoZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendObject, Zval};
@@ -5,7 +6,6 @@ use ext_php_rs::zend::{ClassEntry, Function};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::{pending, Future};
-use std::pin::Pin;
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tokio_util::sync::CancellationToken;
@@ -26,16 +26,12 @@ pub struct EventLoop {
 struct Fiber(Zval);
 
 impl Fiber {
-    fn suspend(&self) {
-        self.0
-            .try_call_method("suspend", vec![])
-            .expect("suspend fiber");
+    fn suspend(&self) -> ext_php_rs::error::Result<Zval> {
+        self.0.try_call_method("suspend", vec![])
     }
 
-    fn resume(&self) {
-        self.0
-            .try_call_method("resume", vec![])
-            .expect("fiber resume");
+    fn resume(&self) -> ext_php_rs::error::Result<Zval> {
+        self.0.try_call_method("resume", vec![])
     }
 }
 
@@ -115,22 +111,13 @@ impl EventLoop {
             d.next += 1;
             (fiber, id_tx, next, d.handle.clone())
         });
-        let f = handle.spawn(unsafe {
-            #[allow(clippy::missing_transmute_annotations)]
-            std::mem::transmute::<_, Pin<Box<dyn Future<Output = F::Output> + Send>>>(Box::pin(
-                async move {
-                    let result = future.await;
-                    let _ = id_tx.send(next);
-                    result
-                },
-            )
-                as Pin<Box<dyn Future<Output = F::Output>>>)
+        let scope = Scope::spawn(handle, async move {
+            let result = future.await;
+            let _ = id_tx.send(next);
+            result
         });
-        // todo: to make the above unsafe safe we should make sure not to allow suspend to panic or create some kind of gaurd that would still block even if suspend paniced
-        fiber.suspend();
-        handle
-            .block_on(f)
-            .map_err(|e| PhpException::default(e.to_string()))
+        fiber.suspend()?;
+        Ok(scope.finish_or_abort().map_err(|e| e.to_string())?)
     }
 }
 
@@ -211,17 +198,21 @@ pub fn repeat(seconds: f64, callable: &Zval) -> PhpResult<Task> {
 
 #[php_function]
 #[php(name = "PhpTokio\\run")]
-pub fn run() {
-    let rx = DRIVER.with_borrow_mut(|d| d.rx.take()).unwrap();
+pub fn run() -> PhpResult<()> {
+    let Some(rx) = DRIVER.with_borrow_mut(|d| d.rx.take()) else {
+        return Err("Event loop already running".into());
+    };
     loop {
         if DRIVER.with_borrow(|d| d.fibers.is_empty()) {
             break;
         }
         let fiber_id = rx.recv().unwrap();
         if let Some(fiber) = DRIVER.with_borrow_mut(|d| d.fibers.remove(&fiber_id)) {
-            fiber.resume()
+            fiber.resume()?;
         }
     }
+    DRIVER.with_borrow_mut(|d| d.rx = Some(rx));
+    Ok(())
 }
 
 pub fn setup_module(module: ModuleBuilder) -> ModuleBuilder {

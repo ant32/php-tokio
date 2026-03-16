@@ -17,8 +17,8 @@ use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::{quote, ToTokens};
 use syn::parse_quote;
-use syn::{ImplItemFn, ItemFn};
 use syn::{parse_macro_input, ItemImpl};
+use syn::{ImplItemFn, ItemFn};
 
 #[proc_macro_attribute]
 pub fn php_async_function(
