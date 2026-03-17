@@ -11,16 +11,33 @@ use tokio::runtime::{Handle, Runtime};
 use tokio_util::sync::CancellationToken;
 
 thread_local! {
-    static DRIVER: RefCell<EventLoop> = RefCell::new(EventLoop::new());
+    static DRIVER: RefCell<Option<EventLoop>> = const { RefCell::new(None) };
 }
 
 pub struct EventLoop {
     next: u64,
     fibers: HashMap<u64, Fiber>,
     handle: Handle,
+    cancellation_token: CancellationToken,
     fiber_get_current: Function,
     rx: Option<std::sync::mpsc::Receiver<u64>>,
     tx: std::sync::mpsc::Sender<u64>,
+}
+
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        self.cancellation_token.cancel()
+    }
+}
+
+fn with_driver<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut EventLoop) -> R,
+{
+    DRIVER.with_borrow_mut(|d| {
+        let d = d.get_or_insert_with(EventLoop::new);
+        f(d)
+    })
 }
 
 struct Fiber(Zval);
@@ -65,13 +82,15 @@ impl EventLoop {
         let (rt_tx, rt_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create runtime");
+            let cancel = CancellationToken::new();
             rt_tx
-                .send(rt.handle().clone())
+                .send((rt.handle().clone(), cancel.clone()))
                 .expect("Failed to send handle");
-            rt.block_on(pending::<()>());
+            rt.block_on(cancel.run_until_cancelled(pending::<()>()));
+            rt.shutdown_timeout(Duration::from_secs(1))
         });
 
-        let handle = rt_rx.recv().expect("Failed to receive handle");
+        let (handle, cancellation_token) = rt_rx.recv().expect("Failed to receive handle");
 
         let fiber_get_current = Function::try_from_method("\\Fiber", "getCurrent")
             .expect("Fiber::getCurrent not found");
@@ -81,21 +100,11 @@ impl EventLoop {
             next: 0,
             fibers: HashMap::new(),
             handle,
+            cancellation_token,
             tx,
             rx: Some(rx),
             fiber_get_current,
         }
-    }
-
-    pub fn execute_cancellable<F>(
-        future: F,
-        cancel: CancellationToken,
-    ) -> PhpResult<Option<F::Output>>
-    where
-        F: Future + Send,
-        F::Output: Send + 'static,
-    {
-        EventLoop::suspend_on(cancel.run_until_cancelled(future))
     }
 
     pub fn suspend_on<F>(future: F) -> PhpResult<F::Output>
@@ -103,7 +112,7 @@ impl EventLoop {
         F: Future + Send,
         F::Output: Send + 'static,
     {
-        let (fiber, id_tx, next, handle) = DRIVER.with_borrow_mut(|d| {
+        let (fiber, id_tx, next, handle) = with_driver(|d| {
             let id_tx = d.tx.clone();
             let fiber = Fiber(d.fiber_get_current.try_call(vec![]).unwrap());
             let next = d.next;
@@ -118,6 +127,10 @@ impl EventLoop {
         });
         fiber.suspend()?;
         Ok(scope.finish_or_abort().map_err(|e| e.to_string())?)
+    }
+
+    pub fn shutdown() {
+        DRIVER.with_borrow_mut(|d| *d = None)
     }
 }
 
@@ -155,13 +168,10 @@ pub fn delay(seconds: f64, callable: &Zval) -> PhpResult<Task> {
     let cancelled = cancel.clone();
     let callable = callable.shallow_clone();
     let closure = Closure::wrap_once(Box::new(move || -> PhpResult<()> {
-        EventLoop::execute_cancellable(
-            async move {
-                let duration = Duration::from_secs_f64(seconds);
-                tokio::time::sleep(duration).await;
-            },
-            cancel.clone(),
-        )?;
+        EventLoop::suspend_on(cancel.run_until_cancelled(async move {
+            let duration = Duration::from_secs_f64(seconds);
+            tokio::time::sleep(duration).await;
+        }))?;
         if !cancel.is_cancelled() {
             let _ = callable.try_call(vec![]);
         }
@@ -179,13 +189,10 @@ pub fn repeat(seconds: f64, callable: &Zval) -> PhpResult<Task> {
     let callable = callable.shallow_clone();
     let closure = Closure::wrap_once(Box::new(move || -> PhpResult<()> {
         loop {
-            EventLoop::execute_cancellable(
-                async move {
-                    let duration = Duration::from_secs_f64(seconds);
-                    tokio::time::sleep(duration).await;
-                },
-                cancel.clone(),
-            )?;
+            EventLoop::suspend_on(cancel.run_until_cancelled(async move {
+                let duration = Duration::from_secs_f64(seconds);
+                tokio::time::sleep(duration).await;
+            }))?;
             if cancel.is_cancelled() {
                 return Ok(());
             }
@@ -199,19 +206,19 @@ pub fn repeat(seconds: f64, callable: &Zval) -> PhpResult<Task> {
 #[php_function]
 #[php(name = "PhpTokio\\run")]
 pub fn run() -> PhpResult<()> {
-    let Some(rx) = DRIVER.with_borrow_mut(|d| d.rx.take()) else {
+    let Some(rx) = with_driver(|d| d.rx.take()) else {
         return Err("Event loop already running".into());
     };
     loop {
-        if DRIVER.with_borrow(|d| d.fibers.is_empty()) {
+        if with_driver(|d| d.fibers.is_empty()) {
             break;
         }
         let fiber_id = rx.recv().unwrap();
-        if let Some(fiber) = DRIVER.with_borrow_mut(|d| d.fibers.remove(&fiber_id)) {
+        if let Some(fiber) = with_driver(|d| d.fibers.remove(&fiber_id)) {
             fiber.resume()?;
         }
     }
-    DRIVER.with_borrow_mut(|d| d.rx = Some(rx));
+    with_driver(|d| d.rx = Some(rx));
     Ok(())
 }
 
